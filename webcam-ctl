@@ -1,0 +1,456 @@
+#!/bin/bash
+
+# Camera controls for the Camera tuning plugin: list the cameras, set one
+# control and remember it, put remembered controls back when a camera
+# appears or the machine wakes, forget them again, and switch a USB camera
+# off and on.
+#
+# Remembered values live in ~/.config/omarchy/webcam.json, keyed by the
+# camera's USB serial string (the same one /dev/v4l/by-id uses), so the same
+# camera gets its settings back on any port.
+#
+# Everything the shell collects whole is bounded here, on the producer side:
+# every device tool runs under a deadline, the control listing and the camera
+# list are capped in bytes, and every string read from a device or a process
+# is capped in length. Truncation is reported, never hidden.
+
+set -o pipefail
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/webcam.json"
+DEV_DIR="${WEBCAM_CTL_DEV_DIR:-/dev}"
+SYS_DIR="${WEBCAM_CTL_SYS_DIR:-/sys}"
+# A wedged camera makes v4l2-ctl hang for as long as the kernel retries; no
+# call into a device tool outlives this many seconds.
+TOOL_TIMEOUT="${WEBCAM_CTL_TIMEOUT:-10}"
+CONTROLS_CAP=$((256 * 1024))   # bytes of `controls` output
+LIST_CAP=$((256 * 1024))       # bytes of `list` output
+FIELD_CAP=256                  # bytes of any name, id or process name
+MAX_CAMERAS=128                # the kernel allows 256 video minors
+# The one root step is tee, a fixed system binary. The tests stand in a fake
+# for pkexec; nothing else does.
+PKEXEC="${WEBCAM_CTL_PKEXEC:-/usr/bin/pkexec}"
+TEE=/usr/bin/tee
+
+for tool in v4l2-ctl jq udevadm timeout; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "webcam-ctl: needs $tool" >&2; exit 1; }
+done
+
+usage() {
+  cat <<USAGE
+Usage: webcam-ctl <command> [args]
+
+  list                 cameras that can capture video, as JSON
+  controls <device>    the camera's controls, as v4l2-ctl lists them
+  saved <device>       remembered controls for a camera, as JSON
+  set <device> <control>=<value>
+                       set a control and remember it
+  apply [device]       set remembered controls on one camera, or on all
+  reset <device>       camera defaults, and forget what was remembered
+  off <device>         switch a USB camera off (asks for your password)
+  on <id>              switch it back on (asks again)
+  watch                report cameras coming and going, re-applying as they do
+USAGE
+}
+
+fail() {
+  echo "webcam-ctl: $*" >&2
+  exit 1
+}
+
+# Every device tool runs under the deadline, in its own process group, so a
+# hang ends with the tool and its children gone.
+run() {
+  timeout -k 2 "$TOOL_TIMEOUT" "$@"
+}
+
+# At most FIELD_CAP bytes, on one line, no NULs.
+field() {
+  head -c "$FIELD_CAP" | tr -d '\0\n\r'
+}
+
+# A device argument is a video node in DEV_DIR and nothing else: the helper
+# hands it to tools, and a path is not a camera because it was typed.
+is_video_node() {
+  [[ ${1%/*} == "$DEV_DIR" && ${1##*/} =~ ^video[0-9]+$ ]]
+}
+
+require_device() {
+  is_video_node "${1:-}" && [[ -e $1 ]] || fail "not a video device: ${1:-}"
+}
+
+# A node worth listing captures video and is a real camera: v4l2loopback
+# (OBS's virtual camera and friends) also captures, but it is someone else's
+# picture with no controls of its own.
+capture_capable() {
+  run v4l2-ctl --device "$1" --info 2>/dev/null | head -c 65536 | awk '
+    /^[[:space:]]*Driver name[[:space:]]*:/ && /v4l2 loopback|v4l2loopback/ { loopback = 1 }
+    /^[[:space:]]*Device Caps[[:space:]]*:/ { inspect = 1; next }
+    inspect && /^[[:space:]]*Video Capture/ { found = 1 }
+    END { exit !(found && !loopback) }
+  '
+}
+
+camera_name() {
+  run v4l2-ctl --device "$1" --info 2>/dev/null | head -c 65536 | awk -F': ' '/Card type/ { print $2; exit }' | field
+}
+
+udev_property() {
+  run udevadm info --query=property --name="$1" 2>/dev/null | head -c 65536 | awk -F= -v key="$2" '$1 == key { print substr($0, length(key) + 2); exit }' | field
+}
+
+# The USB serial string, which is what the by-id symlink is named after. A
+# camera without one falls back to its bus path, and a non-USB camera to its
+# name; neither follows the camera to another port, but both are stable.
+camera_id() {
+  local serial path
+  serial=$(udev_property "$1" ID_SERIAL)
+  if [[ -n $serial ]]; then
+    echo "$serial"
+    return
+  fi
+  path=$(udev_property "$1" ID_PATH)
+  if [[ -n $path ]]; then
+    echo "$path"
+    return
+  fi
+  camera_name "$1"
+}
+
+# The USB device behind a video node: its sysfs directory holds the
+# `authorized` switch that makes the whole device come and go.
+usb_dir() {
+  local path
+  path=$(run udevadm info --query=path --name="$1" 2>/dev/null | head -c 4096 | head -n1)
+  [[ $path == */video4linux/* ]] || return 1
+  path=${path%%/video4linux/*}   # .../1-9.3.1/1-9.3.1:1.0
+  path=${path%/*}                # .../1-9.3.1
+  [[ -n $path ]] && authorized_file "$path" >/dev/null || return 1
+  echo "$path"
+}
+
+# The one file the root step may write: the `authorized` switch of a USB
+# device. The directory must sit under /sys/devices, be named like a USB
+# port, be reached without following a link (sysfs is full of them, and
+# .../driver/1-10 is another device), belong to the USB bus, and carry a
+# vendor id. Thunderbolt has an `authorized` file too; it does not pass.
+authorized_file() {
+  local dir="$1" full real
+  [[ $dir == /devices/* && $dir != *..* && ${dir##*/} =~ ^[0-9]+-[0-9]+(\.[0-9]+)*$ ]] || return 1
+  full="$SYS_DIR$dir"
+  real=$(readlink -f -- "$SYS_DIR" 2>/dev/null)$dir
+  [[ -d $full && $(readlink -f -- "$full" 2>/dev/null) == "$real" ]] || return 1
+  [[ $(readlink -f -- "$full/subsystem" 2>/dev/null) == */bus/usb ]] || return 1
+  [[ -f $full/idVendor && -f $full/authorized ]] || return 1
+  echo "$full/authorized"
+}
+
+devices() {
+  local dev n=0
+  for dev in "$DEV_DIR"/video*; do
+    [[ -e $dev ]] || continue
+    is_video_node "$dev" || continue
+    (( n < MAX_CAMERAS )) || break
+    capture_capable "$dev" && { echo "$dev"; n=$((n + 1)); }
+  done
+}
+
+# The process that has the camera open, if any: fuser sees this user's
+# processes without privileges, which is where the apps are. The name is the
+# process's own /proc/<pid>/comm, 15 bytes at most.
+camera_user() {
+  local pid name first=""
+  for pid in $(run fuser "$1" 2>/dev/null | head -c 4096); do
+    [[ $pid =~ ^[0-9]+$ ]] || continue
+    name=$(field 2>/dev/null <"/proc/$pid/comm")
+    [[ -n $name ]] || continue
+    [[ -z $first ]] && first=$name
+    # The shell holds a handle of its own while its preview is up; the app
+    # that matters is any other one.
+    [[ $name == quickshell* ]] || { echo "$name"; return 0; }
+  done
+  echo "$first"
+}
+
+# An off camera is still on its port, just de-authorized. One whose port is
+# empty was unplugged while off, and it will come back authorized when it is
+# plugged in again, so it is neither listed nor marked any longer.
+forget_unplugged_off_cameras() {
+  [[ -f $CONFIG ]] || return 0
+  local id usb gone=()
+  while IFS=$'\t' read -r id usb; do
+    [[ -n $usb && -e "$SYS_DIR$usb" ]] || gone+=("$id")
+  done < <(jq -r 'to_entries[] | select(.value.off == true) | [.key, (.value.usb // "")] | @tsv' "$CONFIG" 2>/dev/null)
+  (( ${#gone[@]} )) || return 0
+  jq --argjson gone "$(printf '%s\n' "${gone[@]}" | jq -R . | jq -cs .)" \
+    'with_entries(if (.key as $k | $gone | index($k)) != null then .value |= del(.off) else . end)' "$CONFIG" | write_config
+}
+
+off_cameras() {
+  [[ -f $CONFIG ]] || return 0
+  jq -c 'to_entries[] | select(.value.off == true)
+    | {device: "", id: .key, name: (.value.name // ""), app: "", usb: (.value.usb // ""), off: true}' "$CONFIG" 2>/dev/null
+}
+
+cmd_list() {
+  local dev usb present
+  # One camera per id: a second capture node behind the same serial (an
+  # infrared sensor beside the color one) folds into the first.
+  present=$({
+    for dev in $(devices); do
+      usb=$(usb_dir "$dev" || true)
+      jq -cn --arg device "$dev" --arg id "$(camera_id "$dev")" --arg name "$(camera_name "$dev")" \
+        --arg app "$(camera_user "$dev")" --arg usb "$usb" \
+        '{device: $device, id: $id, name: $name, app: $app, usb: $usb, off: false}'
+    done
+  } | jq -cs 'sort_by(.device) | unique_by(.id) | sort_by(.device)')
+  # A camera marked off that is back anyway (the kernel authorizes everything
+  # again at boot) is simply on; drop the mark rather than show a lie.
+  if [[ -f $CONFIG ]] && jq -e 'any(.[]; .off == true)' "$CONFIG" >/dev/null 2>&1; then
+    jq --argjson present "$present" '
+      ($present | map(.id)) as $ids
+      | with_entries(if .value.off == true and (.key as $id | $ids | index($id)) != null
+                     then .value |= del(.off) else . end)' "$CONFIG" | write_config
+  fi
+  forget_unplugged_off_cameras
+  # With MAX_CAMERAS entries of capped fields this stays well inside the cap;
+  # the cap is the hard bound the shell can count on.
+  jq -cs 'add | sort_by(.off, .device)' <(echo "$present") <(off_cameras | jq -cs '.') | head -c "$LIST_CAP"
+}
+
+# The camera's controls as v4l2-ctl prints them, at most CONTROLS_CAP bytes.
+# A listing that hit the cap ends with a marker line so the panel can say the
+# list is cut short rather than show a shorter camera.
+cmd_controls() {
+  require_device "$1"
+  local out rc
+  out=$(export LC_ALL=C; run v4l2-ctl --device "$1" --list-ctrls-menus 2>/dev/null | head -c $((CONTROLS_CAP + 1)); exit "${PIPESTATUS[0]}")
+  rc=$?
+  export LC_ALL=C
+  if (( ${#out} > CONTROLS_CAP )); then
+    printf '%s\n# truncated\n' "${out:0:CONTROLS_CAP}"
+  else
+    printf '%s\n' "$out"
+  fi
+  return "$rc"
+}
+
+saved_controls() {
+  [[ -f $CONFIG ]] || { echo '{}'; return; }
+  jq -c --arg id "$1" '.[$id].controls // {}' "$CONFIG" 2>/dev/null || echo '{}'
+}
+
+cmd_saved() {
+  require_device "$1"
+  saved_controls "$(camera_id "$1")"
+}
+
+# Replaces the config with what arrives on stdin, atomically, and never with
+# nothing: a jq that failed upstream produces no output, and an empty file
+# would lose every camera's settings.
+write_config() {
+  local tmp content
+  content=$(cat)
+  [[ -n $content ]] || fail "refusing to write an empty $CONFIG"
+  mkdir -p "$(dirname "$CONFIG")"
+  tmp=$(mktemp "$(dirname "$CONFIG")/.webcam.json.XXXXXX") || fail "cannot write $CONFIG"
+  if printf '%s\n' "$content" >"$tmp"; then
+    # -T: a directory at the config path is an error, not a place to put it.
+    mv -fT "$tmp" "$CONFIG" || { rm -f "$tmp"; fail "cannot write $CONFIG"; }
+  else
+    rm -f "$tmp"
+    fail "cannot write $CONFIG"
+  fi
+}
+
+remember() {
+  local id="$1" name="$2" control="$3" value="$4"
+  { [[ -f $CONFIG ]] && cat "$CONFIG" || echo '{}'; } \
+    | jq --arg id "$id" --arg name "$name" --arg control "$control" --argjson value "$value" \
+      '.[$id].name = $name | .[$id].controls[$control] = $value' \
+    | write_config
+}
+
+forget() {
+  [[ -f $CONFIG ]] || return 0
+  jq --arg id "$1" 'del(.[$id])' "$CONFIG" | write_config
+}
+
+cmd_set() {
+  local dev="${1:-}" assignment="${2:-}"
+  require_device "$dev"
+  [[ -n $assignment ]] || fail "set needs a device and control=value"
+  [[ $assignment =~ ^([a-z0-9_]+)=(-?[0-9]+)$ ]] || fail "expected control=value, got '$assignment'"
+  local control="${BASH_REMATCH[1]}" value="${BASH_REMATCH[2]}"
+  run v4l2-ctl --device "$dev" --set-ctrl "$assignment" || exit 1
+  remember "$(camera_id "$dev")" "$(camera_name "$dev")" "$control" "$value"
+}
+
+# Every control on its own call: the kernel applies a batch atomically, so one
+# value the camera refuses (a manual focus while autofocus is on) would take
+# the others down with it. Mode switches go first for the same reason.
+apply_values() {
+  local dev="$1" values="$2" quiet="${3:-}" line rc=0
+  while IFS= read -r line; do
+    [[ $line =~ ^[a-z0-9_]+=-?[0-9]+$ ]] || continue
+    if ! run v4l2-ctl --device "$dev" --set-ctrl "$line" 2>/dev/null; then
+      [[ -n $quiet ]] || echo "webcam-ctl: $dev refused $line" >&2
+      rc=1
+    fi
+  done < <(jq -r 'to_entries
+    | (map(select(.key | test("auto"))) + map(select(.key | test("auto") | not)))
+    | .[] | "\(.key)=\(.value)"' <<<"$values")
+  return $rc
+}
+
+apply_device() {
+  local dev="$1" values
+  values=$(saved_controls "$(camera_id "$dev")")
+  [[ $values != '{}' && -n $values ]] || return 0
+  apply_values "$dev" "$values"
+}
+
+cmd_apply() {
+  local dev rc=0
+  if [[ -n ${1:-} ]]; then
+    require_device "$1"
+    apply_device "$1" || rc=1
+  else
+    # The listed cameras, one node each, not every capture node.
+    for dev in $(cmd_list | jq -r '.[] | select(.device != "") | .device'); do
+      is_video_node "$dev" || continue
+      apply_device "$dev" || rc=1
+    done
+  fi
+  return $rc
+}
+
+# The only root step: tee, a fixed system binary, writing 0 or 1 to the one
+# sysfs file authorized_file() accepted. The value travels on stdin and the
+# path in argv, so nothing from this plugin's directory runs as root and the
+# polkit dialog shows exactly what will happen.
+set_authorized() {
+  local file="$1" value="$2"
+  [[ $value == 0 || $value == 1 ]] || return 1
+  printf '%s\n' "$value" | "$PKEXEC" "$TEE" -- "$file" >/dev/null
+}
+
+# Off remembers the port first, then asks; the off mark itself is written
+# only once the device is really gone, because list clears the mark of any
+# camera that is present, and the camera is present for as long as the
+# password prompt is up.
+cmd_off() {
+  local dev="${1:-}" id name usb file
+  require_device "$dev"
+  usb=$(usb_dir "$dev") || fail "$dev is not a USB camera that can be switched off"
+  file=$(authorized_file "$usb") || fail "$usb has no authorized switch"
+  id=$(camera_id "$dev"); name=$(camera_name "$dev")
+  { [[ -f $CONFIG ]] && cat "$CONFIG" || echo '{}'; } \
+    | jq --arg id "$id" --arg name "$name" --arg usb "$usb" \
+      '.[$id].name = $name | .[$id].usb = $usb' \
+    | write_config
+  set_authorized "$file" 0 || exit 1
+  jq --arg id "$id" '.[$id].off = true' "$CONFIG" | write_config
+}
+
+cmd_on() {
+  local id="${1:-}" usb file
+  [[ -n $id ]] || fail "on needs a camera id"
+  [[ -f $CONFIG ]] || fail "nothing known about $id"
+  usb=$(jq -r --arg id "$id" '.[$id].usb // ""' "$CONFIG")
+  [[ -n $usb ]] || fail "no USB port remembered for $id"
+  file=$(authorized_file "$usb") || fail "$usb is not a USB device"
+  set_authorized "$file" 1 || exit 1
+  jq --arg id "$id" '.[$id] |= del(.off)' "$CONFIG" | write_config
+}
+
+cmd_reset() {
+  local dev="${1:-}" defaults
+  require_device "$dev"
+  defaults=$(run v4l2-ctl --device "$dev" --list-ctrls 2>/dev/null | head -c "$CONTROLS_CAP" | awk '
+    /^[[:space:]]*[a-z0-9_]+ 0x[0-9a-f]+ \((bool|int|menu|intmenu)\)/ {
+      name = $1
+      for (i = 1; i <= NF; i++) if ($i ~ /^default=-?[0-9]+$/) { split($i, kv, "="); printf "\"%s\":%s,", name, kv[2] }
+    }' | sed 's/,$//')
+  # Defaults for controls the camera holds inactive are refused by design;
+  # that is not worth a line in the shell log.
+  [[ -n $defaults ]] && apply_values "$dev" "{$defaults}" quiet
+  forget "$(camera_id "$dev")"
+}
+
+# One line per event on stdout: "added /dev/videoN" once the device is usable
+# and its remembered controls are back, "removed /dev/videoN", "changed" when
+# something came or went on the USB bus, and "resumed" after a wake from
+# sleep, when a USB camera may have been reset without a new device node.
+#
+# The producers (two inotifywait, one gdbus monitor) live in one process
+# substitution with a PID of its own, so a TERM to this shell reaches them
+# through one kill, and they leave on their own if this shell disappears
+# without one. A write that fails because the reader is gone ends the loop,
+# whatever the disposition of SIGPIPE.
+cmd_watch() {
+  local line path producer ev
+  exec {ev}< <(
+    trap 'kill $(jobs -p) 2>/dev/null; exit 0' TERM INT
+    # /dev rather than /dev/v4l/by-id: the by-id directory itself comes and
+    # goes with the first camera.
+    stdbuf -oL inotifywait -m -q -e create -e delete --format 'dev %e %w%f' "$DEV_DIR" 2>/dev/null &
+    # A camera switched off has no video node to lose when it is unplugged;
+    # the USB bus still shows the device going. Any change there is worth a
+    # fresh list.
+    if [[ -d "$DEV_DIR/bus/usb" ]]; then
+      stdbuf -oL inotifywait -m -r -q -e create -e delete --format 'usb %e %w%f' "$DEV_DIR/bus/usb" 2>/dev/null &
+    fi
+    # logind announces the wake as PrepareForSleep (false,), a one-tuple.
+    stdbuf -oL gdbus monitor --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1 2>/dev/null \
+      | stdbuf -oL sed -n 's/.*PrepareForSleep (\(true\|false\),\?).*/sleep \1/p' &
+    # A shell restart can take the reader down without a signal it can trap;
+    # the producers then leave on their own rather than watch /dev forever.
+    while kill -0 "$$" 2>/dev/null && [[ -n $(jobs -rp) ]]; do sleep 2; done
+    kill $(jobs -p) 2>/dev/null
+  )
+  producer=$!
+  trap 'exec 2>/dev/null; kill -TERM "$producer" 2>/dev/null; exit 0' TERM INT
+
+  while IFS= read -r -u "$ev" line; do
+    case $line in
+      "dev CREATE "*)
+        path=${line#dev CREATE }
+        is_video_node "$path" || continue
+        run udevadm settle --timeout=5 2>/dev/null
+        capture_capable "$path" || continue
+        apply_device "$path"
+        echo "added $path" || exit 0
+        ;;
+      "dev DELETE "*)
+        path=${line#dev DELETE }
+        is_video_node "$path" || continue
+        echo "removed $path" || exit 0
+        ;;
+      "usb "*)
+        echo "changed" || exit 0
+        ;;
+      "sleep false")
+        # Give the USB stack a moment to finish bringing devices back.
+        sleep 2
+        cmd_apply
+        echo "resumed" || exit 0
+        ;;
+    esac
+  done
+  kill -TERM "$producer" 2>/dev/null
+  return 0
+}
+
+case "${1:-}" in
+  list) cmd_list ;;
+  controls) cmd_controls "${2:-}" ;;
+  saved) cmd_saved "${2:-}" ;;
+  set) cmd_set "${2:-}" "${3:-}" ;;
+  apply) cmd_apply "${2:-}" ;;
+  reset) cmd_reset "${2:-}" ;;
+  off) cmd_off "${2:-}" ;;
+  on) cmd_on "${2:-}" ;;
+  watch) cmd_watch ;;
+  -h | --help | help | "") usage ;;
+  *) fail "unknown command '$1'" ;;
+esac

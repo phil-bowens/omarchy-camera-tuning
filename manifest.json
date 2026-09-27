@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.phil-bowens.camera-tuning",
+  "name": "Camera tuning",
+  "version": "1.0.0",
+  "author": "Phil Bowens",
+  "license": "MIT",
+  "description": "Switch your camera off for real, and keep its settings: controls remembered per camera and restored on plug-in and wake, a live preview, and who has the camera",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Camera tuning",
+    "description": "Off switch, camera controls remembered per camera, preview, who has the camera",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# Run every test in this directory. Each prints TAP-style lines and exits
+# non-zero on the first failure.
+
+set -uo pipefail
+
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")" || exit 1
+
+status=0
+for test in ./*-test.sh; do
+  [[ $test == ./base-test.sh ]] && continue
+  echo "# $test"
+  bash "$test" || status=1
+done
+
+exit $status
